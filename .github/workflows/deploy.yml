@@ -5,9 +5,18 @@ on:
   push:
     branches: [ main ]
 
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+    defaults:
+      run:
+        working-directory: infra
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -15,14 +24,48 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      - name: Terraform Validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Check AWS secrets
+        env:
+          KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$KEY_ID" ] || [ -z "$SECRET" ]; then
+            echo "::error::Faltam as secrets AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform state bucket
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="tfstate-placa-nfc-${ACCOUNT}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+            aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+          fi
+          echo "TF_STATE_BUCKET=$BUCKET" >> "$GITHUB_ENV"
 
       - name: Terraform Init & Apply
         run: |
-          terraform init
-          terraform apply -auto-approve
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=site/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+          terraform apply -auto-approve -input=false
+
+      - name: Site URL
+        run: |
+          URL=$(terraform output -raw site_url)
+          echo "Site: $URL"
+          echo "### Site no ar: $URL" >> "$GITHUB_STEP_SUMMARY"
